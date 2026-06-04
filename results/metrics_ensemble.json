@@ -1,0 +1,47 @@
+{
+  "iteration": [
+    0,
+    1,
+    2
+  ],
+  "success_rate": [
+    0.08,
+    0.1,
+    0.08
+  ],
+  "ood_success_rate": [
+    0.07142857142857142,
+    0.10714285714285714,
+    0.07142857142857142
+  ],
+  "dataset_size": [
+    5000,
+    18800,
+    33200
+  ],
+  "n_success_added": [
+    0,
+    29,
+    31
+  ],
+  "n_her_added": [
+    0,
+    247,
+    257
+  ],
+  "n_expert_transitions": [
+    2500,
+    2500,
+    2500
+  ],
+  "n_success_transitions": [
+    0,
+    1450,
+    3000
+  ],
+  "n_her_transitions": [
+    0,
+    12350,
+    25200
+  ]
+}

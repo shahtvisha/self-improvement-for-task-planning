@@ -1,0 +1,14 @@
+{
+  "iteration": [
+    0
+  ],
+  "success_rate": [
+    0.06
+  ],
+  "ood_success_rate": [
+    0.07142857142857142
+  ],
+  "dataset_size": [
+    2500
+  ]
+}

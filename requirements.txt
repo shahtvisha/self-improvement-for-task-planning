@@ -1,0 +1,15 @@
+# Core robotics
+gymnasium>=0.29
+gymnasium-robotics>=1.2
+numpy>=1.24
+
+# Deep learning
+torch>=2.0
+
+# Online RL (SAC+HER) — the recommended method
+stable-baselines3>=2.0
+
+# Visualization & video
+matplotlib>=3.7
+imageio>=2.31
+imageio-ffmpeg>=0.4
