@@ -137,7 +137,7 @@ def run_sac_her(
         buffer_size=buffer_size,
         device=device,
         seed=seed,
-        tensorboard_log=os.path.join(log_dir, "tb_sac"),
+        tensorboard_log=None,
     )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
@@ -158,7 +158,7 @@ def run_sac_her(
     model.learn(
         total_timesteps=total_timesteps,
         callback=eval_callback,
-        progress_bar=True,
+        progress_bar=False,
         reset_num_timesteps=True,
     )
     elapsed = time.time() - t0

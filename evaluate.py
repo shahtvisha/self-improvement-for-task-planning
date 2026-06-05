@@ -20,6 +20,7 @@ import numpy as np
 import gymnasium as gym
 import gymnasium_robotics  # noqa: F401
 import imageio
+from collections import deque
 from typing import List, Tuple
 
 from policy  import BCPolicy
@@ -34,6 +35,15 @@ def _is_diffusion(policy) -> bool:
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
+def _make_stacked_obs(obs: dict, obs_buf: deque) -> dict:
+    """Replace obs['observation'] with the rolling-buffer stacked version."""
+    return {
+        "observation":  np.concatenate(list(obs_buf)),
+        "achieved_goal": obs["achieved_goal"],
+        "desired_goal":  obs["desired_goal"],
+    }
+
+
 def evaluate_policy(
     policy,
     env_id:          str,
@@ -43,10 +53,12 @@ def evaluate_policy(
     goal_threshold:  float = 1.35,
     device:          str   = "cpu",
     seed_offset:     int   = 9999,
+    obs_horizon:     int   = 1,
 ) -> Tuple[float, float]:
     """
     Evaluate policy success rate overall and on OOD goals.
     Supports both BCPolicy (single-step) and DiffusionPolicy (chunked).
+    Handles obs_horizon > 1 via a per-episode rolling deque.
 
     Returns: (overall_success_rate, ood_success_rate)
     """
@@ -62,20 +74,30 @@ def evaluate_policy(
         obs, _ = env.reset(seed=seed_offset + ep_idx)
         is_ood  = obs["desired_goal"][goal_axis] <= goal_threshold
 
+        # Initialise rolling buffer with first real observation
+        obs_buf = deque(
+            [obs["observation"].copy()] * obs_horizon,
+            maxlen=obs_horizon,
+        )
+
         done = truncated = False
         episode_success  = False
 
         while not (done or truncated):
+            obs_buf.append(obs["observation"].copy())
+            stacked = _make_stacked_obs(obs, obs_buf)
+
             if use_chunks:
-                chunk = policy.act_chunk(obs, device=device)   # (chunk_size, 4)
+                chunk = policy.act_chunk(stacked, device=device)   # (chunk_size, 4)
                 for action in chunk:
                     if done or truncated:
                         break
                     obs, _, done, truncated, info = env.step(action)
+                    obs_buf.append(obs["observation"].copy())
                     if info.get("is_success", False):
                         episode_success = True
             else:
-                action = policy.act(obs, device=device)
+                action = policy.act(stacked, device=device)
                 obs, _, done, truncated, info = env.step(action)
                 if info.get("is_success", False):
                     episode_success = True
@@ -94,19 +116,18 @@ def evaluate_policy(
 
 def collect_self_rollouts(
     policy,
-    env_id:     str,
-    n_episodes: int = 200,
-    device:     str = "cpu",
-    iteration:  int = 0,
+    env_id:      str,
+    n_episodes:  int = 200,
+    device:      str = "cpu",
+    iteration:   int = 0,
+    obs_horizon: int = 1,
 ) -> List[Episode]:
     """
-    Collect self-rollout episodes. Supports chunked execution for DiffusionPolicy.
+    Collect self-rollout episodes with observation history support.
 
-    For DiffusionPolicy: policy is queried every chunk_size steps.
-    For BCPolicy:        policy is queried every step.
-
-    In both cases every individual transition is stored (not just chunk-starts),
-    so HER relabeling still operates on individual transitions.
+    Each episode maintains a rolling deque of raw observations (length obs_horizon).
+    The stacked obs is what's passed to the policy AND stored in the dataset,
+    matching the representation used during expert collection.
     """
     env = gym.make(env_id, render_mode=None)
     policy.eval()
@@ -119,32 +140,43 @@ def collect_self_rollouts(
         done = truncated = False
         episode_success  = False
 
+        # Initialise rolling buffer with first real observation
+        obs_buf = deque(
+            [obs["observation"].copy()] * obs_horizon,
+            maxlen=obs_horizon,
+        )
+
         while not (done or truncated):
+            obs_buf.append(obs["observation"].copy())
+            stacked = _make_stacked_obs(obs, obs_buf)
+
             if use_chunks:
-                chunk = policy.act_chunk(obs, device=device)   # (chunk_size, 4)
+                chunk = policy.act_chunk(stacked, device=device)
                 for action in chunk:
                     if done or truncated:
                         break
-                    obs_body      = obs["observation"].copy()
-                    achieved_goal = obs["achieved_goal"].copy()
-                    desired_goal  = obs["desired_goal"].copy()
+                    # Capture stacked obs BEFORE stepping (what the policy acted on)
+                    stacked_obs_body = np.concatenate(list(obs_buf))
+                    achieved_goal    = obs["achieved_goal"].copy()
+                    desired_goal     = obs["desired_goal"].copy()
 
                     obs, _, done, truncated, info = env.step(action)
+                    obs_buf.append(obs["observation"].copy())
                     if info.get("is_success", False):
                         episode_success = True
 
-                    episode.add_transition(obs_body, action, achieved_goal, desired_goal)
+                    episode.add_transition(stacked_obs_body, action, achieved_goal, desired_goal)
             else:
-                obs_body      = obs["observation"].copy()
-                achieved_goal = obs["achieved_goal"].copy()
-                desired_goal  = obs["desired_goal"].copy()
+                stacked_obs_body = np.concatenate(list(obs_buf))
+                achieved_goal    = obs["achieved_goal"].copy()
+                desired_goal     = obs["desired_goal"].copy()
 
-                action = policy.act(obs, device=device)
+                action = policy.act(stacked, device=device)
                 obs, _, done, truncated, info = env.step(action)
                 if info.get("is_success", False):
                     episode_success = True
 
-                episode.add_transition(obs_body, action, achieved_goal, desired_goal)
+                episode.add_transition(stacked_obs_body, action, achieved_goal, desired_goal)
 
         episode.finalize(episode_success)
         episodes.append(episode)
@@ -157,13 +189,14 @@ def collect_self_rollouts(
 
 def save_rollout_gif(
     policy,
-    env_id:     str,
-    path:       str = "rollout.gif",
-    n_episodes: int = 3,
-    fps:        int = 30,
-    device:     str = "cpu",
+    env_id:      str,
+    path:        str = "rollout.gif",
+    n_episodes:  int = 3,
+    fps:         int = 30,
+    device:      str = "cpu",
+    obs_horizon: int = 1,
 ):
-    """Render n_episodes and save as GIF. Supports chunked policies."""
+    """Render n_episodes and save as GIF. Supports chunked policies and obs history."""
     env = gym.make(env_id, render_mode="rgb_array")
     policy.eval()
     frames = []
@@ -171,6 +204,7 @@ def save_rollout_gif(
 
     for ep in range(n_episodes):
         obs, _ = env.reset(seed=ep * 7)
+        obs_buf = deque([obs["observation"].copy()] * obs_horizon, maxlen=obs_horizon)
         done = truncated = False
 
         while not (done or truncated):
@@ -178,17 +212,21 @@ def save_rollout_gif(
             if frame is not None:
                 frames.append(frame)
 
+            obs_buf.append(obs["observation"].copy())
+            stacked = _make_stacked_obs(obs, obs_buf)
+
             if use_chunks:
-                chunk = policy.act_chunk(obs, device=device)
+                chunk = policy.act_chunk(stacked, device=device)
                 for action in chunk:
                     if done or truncated:
                         break
                     obs, _, done, truncated, _ = env.step(action)
+                    obs_buf.append(obs["observation"].copy())
                     frame = env.render()
                     if frame is not None:
                         frames.append(frame)
             else:
-                action = policy.act(obs, device=device)
+                action = policy.act(stacked, device=device)
                 obs, _, done, truncated, _ = env.step(action)
 
     env.close()

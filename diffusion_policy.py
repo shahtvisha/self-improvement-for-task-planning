@@ -235,6 +235,13 @@ class DiffusionPolicy(nn.Module):
         self.n_inference_steps = n_inference_steps
         self.flat_action_dim   = action_dim * chunk_size
 
+        # Normalisation stats — set by train_diffusion() after computing from dataset.
+        # Default to identity transform (no-op) until training sets them.
+        self.obs_mean = None
+        self.obs_std  = None
+        self.act_mean = None
+        self.act_std  = None
+
         self.denoiser = DiffusionDenoiser(
             action_dim=action_dim, obs_dim=obs_dim,
             chunk_size=chunk_size, hidden_dim=hidden_dim,
@@ -347,12 +354,29 @@ class DiffusionPolicy(nn.Module):
     ) -> np.ndarray:
         """
         Generate a full action chunk from obs dict.
+
+        If normalisation stats have been set by train_diffusion():
+          - Normalise obs before denoising
+          - Denormalise the sampled action chunk before returning
+
         Returns: np.ndarray of shape (chunk_size, action_dim).
         """
         self.eval()
-        flat = BCPolicy._flatten_obs(obs_dict)
+        flat  = BCPolicy._flatten_obs(obs_dict)
         obs_t = torch.FloatTensor(flat).unsqueeze(0).to(device)
-        chunk = self.ddim_sample(obs_t)
+
+        # Obs normalisation (if stats available)
+        if self.obs_mean is not None:
+            obs_t = (obs_t - self.obs_mean.to(device)) / self.obs_std.to(device)
+
+        chunk = self.ddim_sample(obs_t)   # (1, chunk_size, action_dim) normalised
+
+        # Action denormalisation
+        if self.act_mean is not None:
+            act_m = self.act_mean.to(device).view(1, 1, -1)
+            act_s = self.act_std.to(device).view(1, 1, -1)
+            chunk = chunk * act_s + act_m
+
         return chunk.squeeze(0).cpu().numpy()
 
     @torch.no_grad()

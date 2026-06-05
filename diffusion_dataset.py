@@ -76,13 +76,16 @@ class DiffusionDataset(Dataset):
     def __getitem__(self, idx: int):
         i = self.valid_indices[idx]
 
-        obs = torch.FloatTensor(self.base._obs[i])
+        # Go through base.__getitem__ so NormDataset (or plain RoboticsDataset)
+        # can apply normalization transparently — no direct _obs/_actions access.
+        obs, _ = self.base[i]
 
-        # Concatenate chunk_size consecutive actions
-        chunk = np.concatenate(
-            [self.base._actions[i + j] for j in range(self.chunk_size)]
-        )
-        action_chunk = torch.FloatTensor(chunk)
+        # Collect chunk_size consecutive (normalised) actions from same episode
+        action_list = [self.base[i + j][1] for j in range(self.chunk_size)]
+        action_chunk = torch.cat([
+            a if isinstance(a, torch.Tensor) else torch.FloatTensor(a)
+            for a in action_list
+        ])
 
         return obs, action_chunk
 

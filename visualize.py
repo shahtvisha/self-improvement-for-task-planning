@@ -16,6 +16,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.colors import LinearSegmentedColormap
+from collections import deque
 from typing import List, Optional
 import os
 
@@ -44,11 +45,12 @@ METHOD_LABELS = {
 # ── Goal-space heatmap evaluation ─────────────────────────────────────────────
 
 def evaluate_goal_space(
-    policy:     BCPolicy,
-    env_id:     str,
-    n_episodes: int = 400,
-    device:     str = "cpu",
+    policy:      BCPolicy,
+    env_id:      str,
+    n_episodes:  int = 400,
+    device:      str = "cpu",
     seed_offset: int = 0,
+    obs_horizon: int = 1,
 ):
     """
     Run n_episodes with random goals, record (goal_x, goal_y, success).
@@ -64,9 +66,21 @@ def evaluate_goal_space(
         done = truncated = False
         success = False
 
+        # Rolling observation buffer (same pattern as evaluate.py)
+        obs_buf = deque(
+            [obs["observation"].copy()] * obs_horizon,
+            maxlen=obs_horizon,
+        )
+
         while not (done or truncated):
-            action = policy.act(obs, device=device)
+            stacked = {
+                "observation":   np.concatenate(list(obs_buf)),
+                "achieved_goal": obs["achieved_goal"],
+                "desired_goal":  obs["desired_goal"],
+            }
+            action = policy.act(stacked, device=device)
             obs, _, done, truncated, info = env.step(action)
+            obs_buf.append(obs["observation"].copy())
             if info.get("is_success", False):
                 success = True
 
@@ -163,6 +177,7 @@ def heatmap_series(
     goal_axis:   int = 0,
     goal_threshold: float = 1.35,
     out_dir:     str = "results",
+    obs_horizon: int = 1,
 ):
     """
     For each policy checkpoint, evaluate goal-space success and plot as a heatmap.
@@ -201,7 +216,8 @@ def heatmap_series(
     for i, (policy, iteration) in enumerate(zip(policies, iterations)):
         print(f"  Heatmap {i+1}/{n_maps}: iteration {iteration}...")
         results = evaluate_goal_space(policy, env_id, n_episodes=n_episodes,
-                                      device=device, seed_offset=i * 10000)
+                                      device=device, seed_offset=i * 10000,
+                                      obs_horizon=obs_horizon)
         grid, x_edges, y_edges = bin_to_grid(results, grid_size=grid_size)
         all_grids.append(grid)
         all_x_edges.append(x_edges)

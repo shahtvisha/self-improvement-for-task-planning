@@ -37,6 +37,7 @@ Action: [dx, dy, dz, gripper] ∈ [-1, 1]^4
 import numpy as np
 import gymnasium as gym
 import gymnasium_robotics  # noqa: F401
+from collections import deque
 from typing import Dict
 
 from policy  import BCPolicy
@@ -115,23 +116,34 @@ def collect_expert_demos(
     restrict_goals:  bool  = False,
     goal_axis:       int   = 0,
     goal_threshold:  float = 1.35,
+    obs_horizon:     int   = 1,
     verbose:         bool  = True,
 ) -> RoboticsDataset:
     """
     Collect successful expert demonstrations.
 
-    Also applies HER to the expert demos themselves: for each collected demo,
-    we re-run the same trajectory but record it as a demo for a nearby goal
-    (the block's final position). This "demo augmentation" doubles the effective
-    dataset size without any additional rollouts.
+    Observation history: with obs_horizon > 1 the rolling buffer of the last
+    obs_horizon raw observations is concatenated and stored as the obs_body.
+    At the start of each episode the buffer is pre-filled with the first real
+    observation (no zero-padding) so every step has valid history.
+
+    This is the single highest-impact design choice from Chi et al. (2023):
+    stacking the last 2 observations implicitly encodes velocity and task
+    phase, enabling the policy to distinguish "am I approaching the block?"
+    from "am I pushing toward the goal?" without any recurrent architecture.
+
+    Also applies HER to the expert demos themselves (demo augmentation).
 
     Goal restriction: demos only cover goals where desired_goal[goal_axis] > threshold.
-    The OOD region (other side) is left entirely for self-improvement to discover.
     """
     from her import relabel_episode
 
     env = gym.make(env_id, render_mode=None)
     dataset  = RoboticsDataset()
+
+    # Determine body obs dimension for buffer initialization
+    _obs, _ = env.reset()
+    obs_body_dim = _obs["observation"].shape[0]
 
     collected    = 0
     attempts     = 0
@@ -140,7 +152,7 @@ def collect_expert_demos(
     if verbose:
         label = (f"restricted: axis={goal_axis} > {goal_threshold}"
                  if restrict_goals else "full goal distribution")
-        print(f"Collecting {n_demos} expert demos ({label})")
+        print(f"Collecting {n_demos} expert demos ({label})  [obs_horizon={obs_horizon}]")
 
     while collected < n_demos and attempts < max_attempts:
         obs, _ = env.reset()
@@ -154,21 +166,32 @@ def collect_expert_demos(
             if obs["desired_goal"][goal_axis] <= goal_threshold:
                 continue
 
+        # Initialise rolling obs buffer with first real observation (no zero-padding)
+        obs_buf = deque(
+            [obs["observation"].copy()] * obs_horizon,
+            maxlen=obs_horizon,
+        )
+
         episode = Episode(source="expert", iteration=0)
         done = truncated = False
         episode_success  = False
 
         while not (done or truncated):
-            obs_body      = obs["observation"].copy()
+            obs_buf.append(obs["observation"].copy())
+
+            # Stacked obs: [obs_t, obs_{t-1}, ..., obs_{t-H+1}] (most recent first)
+            stacked_obs   = np.concatenate(list(obs_buf))
             achieved_goal = obs["achieved_goal"].copy()
             desired_goal  = obs["desired_goal"].copy()
-            action        = scripted_expert_action(obs, noise=noise)
+            action        = scripted_expert_action(obs, noise=noise)  # expert sees raw obs
 
             next_obs, _, done, truncated, info = env.step(action)
             if info.get("is_success", False):
                 episode_success = True
 
-            episode.add_transition(obs_body, action, achieved_goal, desired_goal)
+            # Store stacked obs in obs_body_list — HER will still work because
+            # it just relabels desired_goal; the stacked obs is treated as opaque.
+            episode.add_transition(stacked_obs, action, achieved_goal, desired_goal)
             obs = next_obs
 
         episode.finalize(episode_success)
@@ -176,7 +199,7 @@ def collect_expert_demos(
         if episode_success:
             dataset.add_episode(episode)
 
-            # Demo augmentation: also add HER-relabeled version of this demo
+            # Demo augmentation: HER-relabeled version of this demo
             her_ep = relabel_episode(episode, min_block_movement=0.02)
             if her_ep is not None:
                 dataset.add_episode(her_ep)
