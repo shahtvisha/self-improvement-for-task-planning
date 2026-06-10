@@ -17,7 +17,7 @@ SAC + HER breaks this cycle:
   - It actively explores its own mistake states and learns from them via reward
   - HER (Hindsight Experience Replay) relabels every episode automatically —
     even total failures provide useful signal (the goal-reaching sub-problem)
-  - Together they achieve 70-80% on FetchPush-v4 in ~500K environment steps
+  - Together they achieve 70-80% on FetchPickAndPlace-v4 in ~500K environment steps
 
 This is the canonical approach:
   Plappert et al. "Multi-Goal Reinforcement Learning: Challenging Robotics
@@ -31,7 +31,7 @@ Usage
 
 # From Python:
   from rl_finetune import run_sac_her
-  model, metrics = run_sac_her("FetchPush-v4", total_timesteps=500_000)
+  model, metrics = run_sac_her("FetchPickAndPlace-v4", total_timesteps=500_000)
 
 Install stable-baselines3 if needed:
   pip install stable-baselines3[extra]
@@ -53,7 +53,7 @@ def _check_sb3():
 
 
 def run_sac_her(
-    env_id:           str   = "FetchPush-v4",
+    env_id:           str   = "FetchPickAndPlace-v4",
     total_timesteps:  int   = 500_000,
     n_sampled_goal:   int   = 4,
     learning_starts:  int   = 1_000,
@@ -66,6 +66,7 @@ def run_sac_her(
     log_dir:          str   = "results",
     verbose:          bool  = True,
     seed:             int   = 42,
+    policy_kwargs:    dict  = None,
 ) -> tuple:
     """
     Train SAC + HER from scratch on a goal-conditioned robotics environment.
@@ -126,7 +127,7 @@ def run_sac_her(
         replay_buffer_class=HerReplayBuffer,
         replay_buffer_kwargs=dict(
             n_sampled_goal=n_sampled_goal,
-            goal_selection_strategy="future",   # relabel with future goals in episode
+            goal_selection_strategy="future",
         ),
         verbose=1 if verbose else 0,
         learning_starts=learning_starts,
@@ -138,6 +139,7 @@ def run_sac_her(
         device=device,
         seed=seed,
         tensorboard_log=None,
+        policy_kwargs=policy_kwargs,
     )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
@@ -199,7 +201,7 @@ def run_sac_her(
 
 def sac_her_rollout_gif(
     model,
-    env_id:     str = "FetchPush-v4",
+    env_id:     str = "FetchPickAndPlace-v4",
     path:       str = "sac_rollout.gif",
     n_episodes: int = 3,
     fps:        int = 30,
@@ -228,3 +230,93 @@ def sac_her_rollout_gif(
     if frames:
         imageio.mimsave(path, frames, fps=fps)
         print(f"  SAC rollout GIF → {path} ({len(frames)} frames)")
+
+
+def continue_training(
+    extra_timesteps: int = 500_000,
+    env_id:          str = "FetchPickAndPlace-v4",
+    log_dir:         str = "results",
+):
+    """Resume training from the saved best checkpoint."""
+    from stable_baselines3 import SAC
+    from stable_baselines3.common.callbacks import EvalCallback
+
+    best_path = os.path.join(log_dir, "sac_best", "best_model")
+    if not os.path.exists(best_path + ".zip"):
+        raise FileNotFoundError("No saved model found. Run run_sac_her() first.")
+
+    env      = gym.make(env_id, render_mode=None)
+    eval_env = gym.make(env_id, render_mode=None)
+
+    print(f"\n  Resuming from {best_path}.zip  (+{extra_timesteps:,} steps)")
+    model = SAC.load(best_path, env=env)
+
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=os.path.join(log_dir, "sac_best"),
+        log_path=os.path.join(log_dir, "sac_eval"),
+        eval_freq=10_000,
+        n_eval_episodes=50,
+        deterministic=True,
+        verbose=0,
+    )
+
+    model.learn(
+        total_timesteps=extra_timesteps,
+        callback=eval_callback,
+        progress_bar=False,
+        reset_num_timesteps=False,   # ← continue from current step count
+    )
+
+    env.close()
+
+    # Reload the best checkpoint found during this run
+    if os.path.exists(best_path + ".zip"):
+        model = SAC.load(best_path, env=gym.make(env_id, render_mode=None))
+
+    successes = []
+    for ep in range(100):
+        obs, _ = eval_env.reset(seed=9000 + ep)
+        done = truncated = False
+        ep_success = False
+        while not (done or truncated):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, done, truncated, info = eval_env.step(action)
+            if info.get("is_success", False):
+                ep_success = True
+        successes.append(float(ep_success))
+
+    eval_env.close()
+    sr = float(np.mean(successes))
+    print(f"  ✓  Success rate after continued training: {sr:.1%}")
+    return model, sr
+
+
+if __name__ == "__main__":
+    import sys, shutil
+
+    if "--continue" in sys.argv:
+        continue_training(extra_timesteps=1_000_000)
+    else:
+        # Fresh retrain with hyperparameters tuned for FetchPickAndPlace:
+        #   gamma=0.95    shorter effective horizon for multi-phase grasping
+        #   n_sampled_goal=8  more HER relabeling → denser signal on rare grasps
+        #   lr=3e-4       more stable convergence on harder task
+        #   net_arch 3×256  extra layer for richer value function
+        #   1.5M steps    PickAndPlace needs ~2× the steps of FetchPush
+
+        # Remove stale checkpoint so EvalCallback saves fresh bests
+        for path in ["results/sac_best", "results/sac_eval"]:
+            if os.path.exists(path):
+                shutil.rmtree(path)
+                print(f"  Removed old checkpoint: {path}")
+
+        model, metrics = run_sac_her(
+            total_timesteps = 1_500_000,
+            n_sampled_goal  = 8,
+            learning_rate   = 3e-4,
+            gamma           = 0.95,
+            tau             = 0.05,
+            policy_kwargs   = dict(net_arch=[256, 256, 256]),
+        )
+        print(f"  Final success rate: {metrics.get('success_rate', 0):.1%}")

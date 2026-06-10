@@ -26,6 +26,7 @@ from dataset          import RoboticsDataset
 from diffusion_dataset import DiffusionDataset
 from policy           import BCPolicy
 from diffusion_policy  import DiffusionPolicy
+from act_policy        import ACTPolicy
 
 
 # ── EMA ───────────────────────────────────────────────────────────────────────
@@ -265,6 +266,101 @@ def train_diffusion(
     return losses
 
 
+# ── ACT training ──────────────────────────────────────────────────────────────
+
+def train_act(
+    policy:        ACTPolicy,
+    dataset:       RoboticsDataset,
+    n_epochs:      int   = 400,
+    batch_size:    int   = 256,
+    lr:            float = 1e-4,
+    weight_decay:  float = 1e-6,
+    warmup_epochs: int   = 20,
+    ema_decay:     float = 0.999,
+    device:        str   = "cpu",
+    verbose:       bool  = True,
+) -> List[float]:
+    """
+    ACT training loop.
+
+    Structurally identical to train_diffusion:
+      - Same DiffusionDataset (action chunks, episode-boundary-aware)
+      - Same obs/action normalisation
+      - Same EMA + warmup-then-cosine LR schedule
+      - Loss = policy.compute_loss() → L2 + β·KL
+    """
+    # ── Normalisation ────────────────────────────────────────────────────────
+    obs_mean, obs_std, act_mean, act_std = compute_normalization(dataset)
+    norm_dataset = NormDataset(dataset, obs_mean, obs_std, act_mean, act_std)
+
+    policy.obs_mean = obs_mean
+    policy.obs_std  = obs_std
+    policy.act_mean = act_mean
+    policy.act_std  = act_std
+
+    # ── Chunk dataset ────────────────────────────────────────────────────────
+    chunk_dataset = DiffusionDataset(
+        norm_dataset,
+        chunk_size=policy.chunk_size,
+        action_dim=policy.action_dim,
+    )
+
+    if len(chunk_dataset) == 0:
+        print("    Warning: DiffusionDataset has 0 valid chunks — skipping training.")
+        return []
+
+    if verbose:
+        print(f"    ACT DiffusionDataset: {chunk_dataset}")
+
+    policy.to(device)
+    policy.obs_mean = obs_mean.to(device)
+    policy.obs_std  = obs_std.to(device)
+    policy.act_mean = act_mean.to(device)
+    policy.act_std  = act_std.to(device)
+    policy.train()
+
+    optimiser = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return epoch / max(1, warmup_epochs)
+        progress = (epoch - warmup_epochs) / max(1, n_epochs - warmup_epochs)
+        return max(1e-6 / lr, 0.5 * (1 + np.cos(np.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lr_lambda)
+    ema = EMAModel(policy, decay=ema_decay)
+
+    drop_last = len(chunk_dataset) > batch_size
+    loader    = DataLoader(chunk_dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last)
+
+    losses = []
+    for epoch in range(n_epochs):
+        policy.train()
+        batch_losses = []
+        for obs_b, chunk_b in loader:
+            obs_b   = obs_b.to(device)
+            chunk_b = chunk_b.to(device).clamp(-3.0, 3.0)
+
+            loss = policy.compute_loss(obs_b, chunk_b)
+            optimiser.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimiser.step()
+            ema.update(policy)
+            batch_losses.append(loss.item())
+
+        scheduler.step()
+        avg = sum(batch_losses) / len(batch_losses)
+        losses.append(avg)
+        if verbose and (epoch + 1) % 50 == 0:
+            print(f"    Epoch {epoch+1}/{n_epochs} | ACT loss: {avg:.5f} "
+                  f"| LR: {scheduler.get_last_lr()[0]:.2e}")
+
+    ema.copy_to(policy)
+    policy.eval()
+    return losses
+
+
 # ── Unified interface ─────────────────────────────────────────────────────────
 
 def train_policy(policy, dataset, config, device: str = "cpu", verbose: bool = True):
@@ -272,7 +368,16 @@ def train_policy(policy, dataset, config, device: str = "cpu", verbose: bool = T
     Dispatch to the correct training function based on policy type.
     Keeps calling code clean — just call train_policy() regardless of type.
     """
-    if isinstance(policy, DiffusionPolicy):
+    if isinstance(policy, ACTPolicy):
+        return train_act(
+            policy, dataset,
+            n_epochs=config.n_epochs, batch_size=config.batch_size,
+            lr=config.act_lr, weight_decay=config.weight_decay,
+            warmup_epochs=getattr(config, "warmup_epochs", 20),
+            ema_decay=getattr(config, "ema_decay", 0.999),
+            device=device, verbose=verbose,
+        )
+    elif isinstance(policy, DiffusionPolicy):
         return train_diffusion(
             policy, dataset,
             n_epochs=config.n_epochs, batch_size=config.batch_size,

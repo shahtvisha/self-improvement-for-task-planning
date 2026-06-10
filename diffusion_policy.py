@@ -329,9 +329,12 @@ class DiffusionPolicy(nn.Module):
             t      = timesteps[i].expand(B)
             t_next = timesteps[i + 1]
 
-            # x0 directly from denoiser
+            # x0 directly from denoiser.
+            # Clamp to ±3 (normalized space) — matches training clamp.
+            # Do NOT clamp to ±1: SAC action std ≈ 0.5, so normalized actions
+            # span ±2 and clamping to ±1 silently halves the effective range.
             x0_pred = self.denoiser(x, obs, t)
-            x0_pred = x0_pred.clamp(-1.0, 1.0)
+            x0_pred = x0_pred.clamp(-3.0, 3.0)
 
             alpha      = self.alphas_cumprod[timesteps[i]]
             alpha_next = self.alphas_cumprod[t_next] if t_next > 0 else torch.tensor(1.0, device=device)
