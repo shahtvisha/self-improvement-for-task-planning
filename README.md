@@ -6,8 +6,7 @@
 
 ## Demo
 
-**SAC Expert  ·  Diffusion Policy  ·  ACT** — same task, same seeds
-
+**SAC Expert  ·  Diffusion Policy  ·  ACT** over same tasks and seeds
 ![3-panel policy comparison](results/eval.gif)
 
 *Each panel shows the goal-distance progress bar (bottom right) filling up as the block approaches the floating target. Green = success, red = failure.*
